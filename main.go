@@ -32,6 +32,7 @@ func main() {
 
 const simpleRFC3339 = "20060102"
 
+// var updateStampRgx = regexp.MustCompile(`(\s*)(\d{8})(.*);`)
 var updateStampRgx = regexp.MustCompile(`(\s*)(\d{8})(\d+);`)
 
 func updateDB(r io.Reader) ([]byte, error) {
@@ -40,13 +41,17 @@ func updateDB(r io.Reader) ([]byte, error) {
 	dateDone := false
 	for sc.Scan() {
 		l := sc.Text()
-		if !dateDone {
+		if dateDone {
 			if _, err := buf.Write([]byte(l+"\n")); err != nil {
 				return nil, err
 			}
 			continue
 		}
+
 			m := updateStampRgx.FindStringSubmatch(l)
+			if m != nil {
+				println(l, "MATCHED")
+			}
 			if m == nil || len(m) != 4 {
 				if _, err := buf.Write([]byte(l+"\n")); err != nil {
 					return nil, err
@@ -54,9 +59,8 @@ func updateDB(r io.Reader) ([]byte, error) {
 				continue
 			}
 			datePart := m[2]
-			t, err := time.Parse(datePart, simpleRFC3339)
-			if err != nil {
-				println(err)
+			if _, err := time.Parse(simpleRFC3339, datePart); err != nil {
+				log.Printf("%v", err)
 				if _, err := buf.Write([]byte(l+"\n")); err != nil {
 					return nil, err
 				}
@@ -64,20 +68,23 @@ func updateDB(r io.Reader) ([]byte, error) {
 			}
 			i, err := strconv.Atoi(m[3])
 			if err != nil {
-				println(err)
+				log.Printf("%v", err)
 				if _, err := buf.Write([]byte(l+"\n")); err != nil {
 					return nil, err
 				}
 				continue
 			}
+			whiteSpace := m[1]
 			var updateStamp string
-			if t.Equal(time.Now()) {
+			today := time.Now().Format(simpleRFC3339)
+			if datePart == today {
 				i++
-				updateStamp = fmt.Sprintf("%s%s%d;", datePart, i)
+				updateStamp = fmt.Sprintf("%s%s%d;\n", whiteSpace, today, i)
 			} else {
-				updateStamp = m[1] + datePart + "1;"
+				println(today, "VS", datePart)
+				updateStamp = whiteSpace + today + "1;\n"
 			}
-			if _, err := buf.Write([]byte(updateStamp+"\n")); err != nil {
+			if _, err := buf.Write([]byte(updateStamp)); err != nil {
 				return nil, err
 			}
 			dateDone = true
