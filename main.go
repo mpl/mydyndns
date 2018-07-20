@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -33,7 +34,7 @@ var (
 	help         = flag.Bool("h", false, "show this help")
 	flagHost     = flag.String("host", "0.0.0.0:8080", "listening port and hostname")
 	flagUserpass = flag.String("userpass", "", "optional username:password protection")
-	flagTLS      = flag.Bool("tls", false, `For https. If "key.pem" or "cert.pem" are not found in $HOME/keys/, in-memory self-signed are generated and used instead.`)
+	flagTLS      = flag.Bool("tls", false, `Enable TLS.`)
 	flagZoneFile = flag.String("zone", "", "zone file to update")
 )
 
@@ -68,6 +69,8 @@ func makeHandler(fn func(http.ResponseWriter, *http.Request, string)) http.Handl
 }
 
 func isAllowed(r *http.Request) bool {
+	// TODO(mpl): I should somehow also have a relation between the name to update
+	// and the auth, so that Jo can only update jo.
 	if *flagUserpass == "" {
 		return true
 	}
@@ -99,7 +102,8 @@ func updateZoneHandler(w http.ResponseWriter, r *http.Request, url string) {
 		return
 	}
 	f.Close()
-	if err := ioutil.WriteFile(newZoneFile, data, 0600); err != nil {
+	// TODO(mpl): find a way to lock newZoneFile a bit tighter against attacks, until I find a whole new safer way?
+	if err := ioutil.WriteFile(newZoneFile, data, 0644); err != nil {
 		http.Error(w, genericError, 500)
 		log.Printf("%v", err)
 		return
@@ -114,11 +118,16 @@ func updateZoneHandler(w http.ResponseWriter, r *http.Request, url string) {
 		log.Printf("%v", err)
 		return
 	}
+	w.Write([]byte(r.RemoteAddr))
 }
 
 var updateStampRgx = regexp.MustCompile(`(\s*)(\d{8})(\d+);`)
 
-func updateZone(r io.Reader, name, ip string) ([]byte, error) {
+func updateZone(r io.Reader, name, addr string) ([]byte, error) {
+	ip, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, fmt.Errorf("could not split host and port in addr %v, %v", addr, err)
+	}
 	if IP := net.ParseIP(ip); IP == nil {
 		return nil, fmt.Errorf("not a valid IP: %q", ip)
 	}
@@ -128,7 +137,7 @@ func updateZone(r io.Reader, name, ip string) ([]byte, error) {
 	for sc.Scan() {
 		l := sc.Text()
 		if dateDone && ipDone {
-			if err := writeLine(l, buf); err != nil {
+			if err := writeLine(l, &buf); err != nil {
 				return nil, err
 			}
 			continue
@@ -137,13 +146,13 @@ func updateZone(r io.Reader, name, ip string) ([]byte, error) {
 		if dateDone {
 			fields := strings.Fields(l)
 			if len(fields) != 4 || fields[1] != "IN" || fields[2] != "A" || fields[0] != name {
-				if err := writeLine(l, buf); err != nil {
+				if err := writeLine(l, &buf); err != nil {
 					return nil, err
 				}
 				continue
 			}
 			newValue := fmt.Sprintf("%s\tIN\tA\t%s", name, ip)
-			if err := writeLine(newValue, buf); err != nil {
+			if err := writeLine(newValue, &buf); err != nil {
 				return nil, err
 			}
 			ipDone = true
@@ -155,7 +164,7 @@ func updateZone(r io.Reader, name, ip string) ([]byte, error) {
 			println(l, "MATCHED")
 		}
 		if m == nil || len(m) != 4 {
-			if err := writeLine(l, buf); err != nil {
+			if err := writeLine(l, &buf); err != nil {
 				return nil, err
 			}
 			continue
@@ -163,7 +172,7 @@ func updateZone(r io.Reader, name, ip string) ([]byte, error) {
 		datePart := m[2]
 		if _, err := time.Parse(simpleRFC3339, datePart); err != nil {
 			log.Printf("%v", err)
-			if err := writeLine(l, buf); err != nil {
+			if err := writeLine(l, &buf); err != nil {
 				return nil, err
 			}
 			continue
@@ -171,7 +180,7 @@ func updateZone(r io.Reader, name, ip string) ([]byte, error) {
 		i, err := strconv.Atoi(m[3])
 		if err != nil {
 			log.Printf("%v", err)
-			if err := writeLine(l, buf); err != nil {
+			if err := writeLine(l, &buf); err != nil {
 				return nil, err
 			}
 			continue
@@ -186,7 +195,7 @@ func updateZone(r io.Reader, name, ip string) ([]byte, error) {
 			println(today, "VS", datePart)
 			updateStamp = whiteSpace + today + "1;"
 		}
-		if err := writeLine(updateStamp, buf); err != nil {
+		if err := writeLine(updateStamp, &buf); err != nil {
 			return nil, err
 		}
 		dateDone = true
@@ -203,7 +212,7 @@ func updateZone(r io.Reader, name, ip string) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func writeLine(l string, buf bytes.Buffer) error {
+func writeLine(l string, buf *bytes.Buffer) error {
 	_, err := buf.Write([]byte(l + "\n"))
 	return err
 }
@@ -211,7 +220,7 @@ func writeLine(l string, buf bytes.Buffer) error {
 // we use mv instead of os.Rename, so we can have sudo for specific commands,
 // and not run the whole thing as root.
 func rotateZoneFiles() error {
-	out, err := exec.Command("sudo", "mv", *flagZoneFile, oldZoneFile).CombinedOutput()
+	out, err := exec.Command("sudo", "cp", *flagZoneFile, oldZoneFile).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%v, %s", err, out)
 	}
@@ -219,6 +228,7 @@ func rotateZoneFiles() error {
 	if err != nil {
 		return fmt.Errorf("%v, %s", err, out)
 	}
+	// TODO(mpl): chown it back to root:bind
 	return nil
 }
 
@@ -242,21 +252,19 @@ func initUserPass() {
 }
 
 func main() {
+	flag.Parse()
 	if *flagZoneFile == "" {
 		usage()
 	}
-	newZoneFile, oldZoneFile = *flagZoneFile+".new", *flagZoneFile+".old"
 
-	nargs := flag.NArg()
-	if nargs > 0 {
-		usage()
-	}
+	// TODO(mpl): this path is unsafe, as if someones owns this account, they could
+	// overwrite newZoneFile so that it ends up replacing the actual zone file.
+	// They'd have to time it right so it happens right before the mv, but still
+	// doable.
+	newZoneFile = filepath.Join(os.Getenv("HOME"), filepath.Base(*flagZoneFile)) + ".new"
+	oldZoneFile = *flagZoneFile + ".old"
 
 	initUserPass()
-
-	if !*flagTLS && *simpletls.FlagAutocert {
-		*flagTLS = true
-	}
 
 	var err error
 	var listener net.Listener
