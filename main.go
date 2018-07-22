@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -43,6 +44,8 @@ var (
 	up                       *basicauth.UserPass
 	mu                       sync.Mutex // guards zone file
 )
+
+var authorizedDomains = []string{"home", "jo"}
 
 func usage() {
 	fmt.Fprintf(os.Stderr, "\t mydyndns \n")
@@ -86,6 +89,18 @@ func updateZoneHandler(w http.ResponseWriter, r *http.Request, url string) {
 		log.Printf("no name parameter in query")
 		return
 	}
+	authorized := false
+	for _, v := range authorizedDomains {
+		if subdomain == v {
+			authorized = true
+			break
+		}
+	}
+	if !authorized {
+		http.Error(w, "nope", 400)
+		log.Printf("not an authorized domain")
+		return
+	}
 	const genericError = "cannot update zone file"
 	f, err := os.Open(*flagZoneFile)
 	if err != nil {
@@ -96,13 +111,16 @@ func updateZoneHandler(w http.ResponseWriter, r *http.Request, url string) {
 	}
 	data, err := updateZone(f, subdomain, r.RemoteAddr)
 	if err != nil {
+		f.Close()
+		if err == sameIPError {
+			w.Write([]byte(r.RemoteAddr))
+			return
+		}
 		http.Error(w, genericError, 500)
 		log.Printf("%v", err)
-		f.Close()
 		return
 	}
 	f.Close()
-	// TODO(mpl): find a way to lock newZoneFile a bit tighter against attacks, until I find a whole new safer way?
 	if err := ioutil.WriteFile(newZoneFile, data, 0644); err != nil {
 		http.Error(w, genericError, 500)
 		log.Printf("%v", err)
@@ -122,6 +140,8 @@ func updateZoneHandler(w http.ResponseWriter, r *http.Request, url string) {
 }
 
 var updateStampRgx = regexp.MustCompile(`(\s*)(\d{8})(\d+);`)
+
+var sameIPError = errors.New("IP in update is already the one for the domain")
 
 func updateZone(r io.Reader, name, addr string) ([]byte, error) {
 	ip, _, err := net.SplitHostPort(addr)
@@ -150,6 +170,9 @@ func updateZone(r io.Reader, name, addr string) ([]byte, error) {
 					return nil, err
 				}
 				continue
+			}
+			if fields[3] == ip {
+				return nil, sameIPError
 			}
 			newValue := fmt.Sprintf("%s\tIN\tA\t%s", name, ip)
 			if err := writeLine(newValue, &buf); err != nil {
@@ -219,6 +242,7 @@ func writeLine(l string, buf *bytes.Buffer) error {
 
 // we use mv instead of os.Rename, so we can have sudo for specific commands,
 // and not run the whole thing as root.
+// it requires sudo with NOPASSWD for bind user for these commands.
 func rotateZoneFiles() error {
 	out, err := exec.Command("sudo", "cp", *flagZoneFile, oldZoneFile).CombinedOutput()
 	if err != nil {
@@ -228,7 +252,6 @@ func rotateZoneFiles() error {
 	if err != nil {
 		return fmt.Errorf("%v, %s", err, out)
 	}
-	// TODO(mpl): chown it back to root:bind
 	return nil
 }
 
@@ -257,11 +280,13 @@ func main() {
 		usage()
 	}
 
-	// TODO(mpl): this path is unsafe, as if someones owns this account, they could
-	// overwrite newZoneFile so that it ends up replacing the actual zone file.
-	// They'd have to time it right so it happens right before the mv, but still
-	// doable.
-	newZoneFile = filepath.Join(os.Getenv("HOME"), filepath.Base(*flagZoneFile)) + ".new"
+	// this is somewhat safe because I run the whole thing as bind, with:
+	// sudo -u bind /usr/local/bin/mydyndns -zone /etc/bind/zones/granivo.re.db
+	// and that /etc/bind/zones/mydyndns is drwxrwxr-x 2 root bind
+	// TODO(mpl): last detail is the let's encrypt cache that user bind needs
+	// access to.
+	bindWIPdir := filepath.Join(filepath.Dir(*flagZoneFile), "mydyndns")
+	newZoneFile = filepath.Join(bindWIPdir, filepath.Base(*flagZoneFile)) + ".new"
 	oldZoneFile = *flagZoneFile + ".old"
 
 	initUserPass()
