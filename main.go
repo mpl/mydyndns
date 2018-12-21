@@ -26,6 +26,9 @@ import (
 	"github.com/mpl/simpletls"
 )
 
+// TODO(mpl): make it run on its own domain (e.g. certs.granivo.re), then bind user can handle its own LE cert.
+// But that won't work as is, because need to listen on 443 for LE challenge.
+
 const (
 	idstring      = "http://golang.org/pkg/http/#ListenAndServe"
 	simpleRFC3339 = "20060102"
@@ -37,15 +40,17 @@ var (
 	flagUserpass = flag.String("userpass", "", "optional username:password protection")
 	flagTLS      = flag.Bool("tls", false, `Enable TLS.`)
 	flagZoneFile = flag.String("zone", "", "zone file to update")
+	flagFake     = flag.Bool("fake", false, "just for testing things")
 )
 
 var (
+	mu                       sync.Mutex // guards zone file, as well as up, because fuck it
 	newZoneFile, oldZoneFile string
-	up                       *basicauth.UserPass
-	mu                       sync.Mutex // guards zone file
+	up                       []*basicauth.UserPass
+	// for now let's just do a direct mapping between username and domain,
+	// except for the initial user who can do anything.
+	authorizedDomains = []string{"home", "jo"}
 )
-
-var authorizedDomains = []string{"home", "jo"}
 
 func usage() {
 	fmt.Fprintf(os.Stderr, "\t mydyndns \n")
@@ -72,12 +77,47 @@ func makeHandler(fn func(http.ResponseWriter, *http.Request, string)) http.Handl
 }
 
 func isAllowed(r *http.Request) bool {
-	// TODO(mpl): I should somehow also have a relation between the name to update
-	// and the auth, so that Jo can only update jo.
 	if *flagUserpass == "" {
 		return true
 	}
-	return up.IsAllowed(r)
+	for _, v := range up {
+		if v.IsAllowed(r) {
+			return true
+		}
+	}
+	return false
+}
+
+func addUserHandler(w http.ResponseWriter, r *http.Request, url string) {
+	mu.Lock()
+	defer mu.Unlock()
+	username, _, err := basicauth.FromReq(r)
+	if err != nil {
+		http.Error(w, "nope", 400)
+		log.Printf("basicauth: %v", err)
+		return
+	}
+	if username != up[0].U {
+		http.Error(w, "nope", 400)
+		log.Printf("user %v can't touch this", username)
+		return
+	}
+	user := r.FormValue("user")
+	password := r.FormValue("password")
+	if user == "" || password == "" {
+		http.Error(w, "nope", 400)
+		log.Printf("missing user or password in query")
+		return
+	}
+	newUp, err := basicauth.New(user + ":" + password)
+	if err != nil {
+		http.Error(w, "nope", 500)
+		log.Printf("new userpass failed: %v", err)
+		return
+	}
+	up = append(up, newUp)
+	w.Write([]byte(user))
+	log.Printf("added user %q", user)
 }
 
 func updateZoneHandler(w http.ResponseWriter, r *http.Request, url string) {
@@ -101,6 +141,18 @@ func updateZoneHandler(w http.ResponseWriter, r *http.Request, url string) {
 		log.Printf("not an authorized domain")
 		return
 	}
+	username, _, err := basicauth.FromReq(r)
+	if err != nil {
+		http.Error(w, "nope", 400)
+		log.Printf("basicauth: %v", err)
+		return
+	}
+	if username != up[0].U && username != subdomain {
+		http.Error(w, "nope", 400)
+		log.Printf("user %v cannot touch subdomain %v", username, subdomain)
+		return
+	}
+
 	const genericError = "cannot update zone file"
 	f, err := os.Open(*flagZoneFile)
 	if err != nil {
@@ -121,6 +173,10 @@ func updateZoneHandler(w http.ResponseWriter, r *http.Request, url string) {
 		return
 	}
 	f.Close()
+	if *flagFake {
+		w.Write([]byte(r.RemoteAddr))
+		return
+	}
 	if err := ioutil.WriteFile(newZoneFile, data, 0644); err != nil {
 		http.Error(w, genericError, 500)
 		log.Printf("%v", err)
@@ -267,11 +323,11 @@ func initUserPass() {
 	if *flagUserpass == "" {
 		return
 	}
-	var err error
-	up, err = basicauth.New(*flagUserpass)
+	firstUp, err := basicauth.New(*flagUserpass)
 	if err != nil {
 		log.Fatal(err)
 	}
+	up = []*basicauth.UserPass{firstUp}
 }
 
 func main() {
@@ -303,6 +359,7 @@ func main() {
 	}
 
 	http.Handle("/update", makeHandler(updateZoneHandler))
+	http.Handle("/adduser", makeHandler(addUserHandler))
 	if err = http.Serve(listener, nil); err != nil {
 		log.Fatalf("Error in http server: %v\n", err)
 	}
