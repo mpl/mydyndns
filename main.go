@@ -49,7 +49,7 @@ var (
 	up                       []*basicauth.UserPass
 	// for now let's just do a direct mapping between username and domain,
 	// except for the initial user who can do anything.
-	authorizedDomains = []string{"home", "jo"}
+	authorizedDomains = []string{"home", "jo", "jb"}
 )
 
 func usage() {
